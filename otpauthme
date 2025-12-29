@@ -11,6 +11,7 @@ Will test against both name and issuer fields as stored in MongoDB.
     add - add a new OTP auth code to the database
     add-qr - read the QR code you took a screenshot of from clipboard and add it to the database.
     update-qr - read the QR code you took a screenshot of from clipboard and update the database.
+    genqr [search] - generate and display a QR code for the OTP secret matching the search term.
 
 This program generates OTP auth codes based on the seed given by an MFA
 authentication provider. This works like-for-like with Google/Microsoft Authenticator.
@@ -66,7 +67,7 @@ import gnupg
 from easydict import EasyDict as edict
 from kizano import Config, getLogger
 from pymongo import MongoClient
-from urllib.parse import ParseResult, urlencode, quote, urlparse, parse_qs
+from urllib.parse import ParseResult, urlencode, quote, unquote, urlparse, parse_qs
 
 log = getLogger(__name__)
 Config.APP_NAME = 'otpauth'
@@ -97,12 +98,12 @@ class OtpAuthCode(edict):
         if self.counter:
             params['counter'] = self.counter
         result = [
-          'otpauth',
-          self.type,
-          quote(self.name),
-          None,
-          urlencode(params),
-          None
+            'otpauth',
+            self.type,
+            quote(self.name),
+            None,
+            urlencode(params),
+            None
         ]
         return ParseResult(*result).geturl()
 
@@ -287,12 +288,58 @@ def parseQR(qrdata: str) -> OtpAuthCode:
     params = parse_qs(qrdata.query)
     config = Config.getConfig()
     return OtpAuthCode(**{
-        'name': qrdata.path.split('/')[-1],
+        'name': unquote(qrdata.path.split('/')[-1]),
         'secret': GnupgHelper(config).encrypt(params['secret'][0]),
         'issuer': params['issuer'][0],
         'type': 'totp',
         'counter': None
     })
+
+def genQR(name: str) -> int:
+    '''
+    Generate a QR code for the OTP auth secret matching the search term.
+    Uses qrencode to generate the QR code and display to show it in-memory.
+    '''
+    log.info(f'Generating QR code for {name}')
+    speak(f'Generating QR code for {name}')
+
+    otpauths = MongoOTP().search(name)
+    if len(otpauths) > 1:
+        otpauths = pickAuth(otpauths)
+    if not len(otpauths):
+        log.error('No auths found.')
+        speak(f'No auths found for {name}')
+        return 1
+
+    otpauth = otpauths.pop()
+    otpauth_url = otpauth.url()
+
+    log.info(f'Generated otpauth URL: {otpauth_url}')
+
+    # Generate QR code using qrencode and pipe directly to display
+    qrencode = subprocess.Popen(
+        ['qrencode', '-s6', '-t', 'PNG', '-o', '-', otpauth_url],
+        stdout=subprocess.PIPE)
+    display = subprocess.Popen(
+        ['display', '-'],
+        stdin=qrencode.stdout
+    )
+
+    # Allow qrencode to receive a SIGPIPE if display exits
+    qrencode.stdout.close()
+
+    # Wait for both processes to complete
+    display.wait()
+    qrencode.wait()
+
+    if qrencode.returncode == 0 and display.returncode == 0:
+        log.info(f'QR code displayed successfully for {otpauth["name"]}')
+        speak(f'QR code displayed for {otpauth["name"]}')
+        return 0
+    else:
+        log.error('Failed to generate or display QR code')
+        speak('Failed to generate QR code')
+        return 1
 
 def usage():
     sys.stderr.write(__doc__)
@@ -313,6 +360,15 @@ def main(name: str):
         return MongoOTP().update(qrdata)
     if re.match('^list$', name, re.IGNORECASE):
         return MongoOTP().list()
+    if re.match('^genqr$', name, re.IGNORECASE):
+        # Check if search term was provided as second argument
+        if len(sys.argv) > 2:
+            search_term = sys.argv[2]
+        else:
+            sys.stderr.write('Search term for QR generation: ')
+            sys.stderr.flush()
+            search_term = input()
+        return genQR(search_term)
     # Default action.
     speak(f'Searching for {name}')
     otpauths = MongoOTP().search(name)
@@ -336,6 +392,9 @@ def main(name: str):
     return 0
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1]))
+    if len(sys.argv) > 1:
+        sys.exit(main(sys.argv[1]))
+    else:
+        sys.exit(main(''))
 
 
