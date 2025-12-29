@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+'''
+Usage:
+
+    otpauthme [name|action]
+
+[name] - some regular expression match against which otpauth code you want generated.
+Will test against both name and issuer fields as stored in MongoDB.
+
+[action] - one of the following:
+    add - add a new OTP auth code to the database
+    add-qr - read the QR code you took a screenshot of from clipboard and add it to the database.
+    update-qr - read the QR code you took a screenshot of from clipboard and update the database.
+
+This program generates OTP auth codes based on the seed given by an MFA
+authentication provider. This works like-for-like with Google/Microsoft Authenticator.
+
+System configuration may be stored in `/etc/otpauth/config.yml`.
+User override configuration may be stored in `~/.config/otpauth/config.yml`.
+
+Configuration would be as such:
+
+    mongo:
+        url: 'mongodb://localhost:27017/?authSource=admin'
+        dbname: 'otpauthgpg'
+
+    signingkey: '0x1234567890ABCDEF'
+    encryptkey: '0x1234567890ABCDEF'
+
+This will allow this app to connect to MongoDB storing the secrets to the OTP
+auth codes.
+
+DB would store a data structure as such:
+
+    {
+        "name": "My Auth Code App",
+        "secret": "GobblyGokThatRepresentsSecretKey",
+        "issuer": "Authoritive Provider",
+        "type": "totp",
+        "counter": null
+    }
+
+In this way, if you run `otpauthme "My Auth"` -- it will straight away return an auth code
+for that app, given there are no other matches with a similar name.
+
+If matches for a similar name are found, it will ask you to tell the script which
+one you want to generate a code for. This is friendly with your clipboard because
+it uses STDERR to communicate requests.
+
+Depends on GPG! You will need a signing key and an encryption key. Normally this can be done
+with a single key pair. Values in the YML config file should be the key ID (e.g. 0x1234567890ABCDEF
+without the leading "0x")
+Values are stored in the DB encrypted and signed with GPG keys. This is so that if you have
+a DB dump, you can't just read the secrets. You would need the GPG keys to decrypt them.
+
+This is a CLI tool, but it is also a library. You can import this module and use it in your
+own Python scripts. See the `OtpAuthCode` class for more information.
+
+'''
+
+import os, sys, json
+import re
+import datetime
+import subprocess
+import gnupg
+from easydict import EasyDict as edict
+from kizano import Config, getLogger
+from pymongo import MongoClient
+from urllib.parse import ParseResult, urlencode, quote, urlparse, parse_qs
+
+log = getLogger(__name__)
+Config.APP_NAME = 'otpauth'
+
+def speak(msg: str) -> None:
+    '''
+    Speak a message to the user.
+    '''
+    log.info(msg)
+    subprocess.run(['espeak-ng', '-a120', '-g2ms', '-p30', '-s150', '-ven-us-nyc+klattt', msg])
+
+class OtpAuthCode(edict):
+    '''
+    Object structure for an OtpAuthCode as it comes from the DB.
+    Probably not necessary for function, more for aesthetics.
+    '''
+    def __init__(self, **kwargs):
+        self['name'] = kwargs.get('name', '')
+        self['secret'] = kwargs.get('secret', '')
+        self['issuer'] = kwargs.get('issuer', '')
+        self['type'] = kwargs.get('type', '')
+        self['counter'] = kwargs.get('counter', None)
+
+    def url(self) -> str:
+        params = { 'secret': self.secret }
+        if self.issuer:
+            params['issuer'] = self.issuer
+        if self.counter:
+            params['counter'] = self.counter
+        result = [
+          'otpauth',
+          self.type,
+          quote(self.name),
+          None,
+          urlencode(params),
+          None
+        ]
+        return ParseResult(*result).geturl()
+
+    def __str__(self) -> str:
+        return json.dumps({
+            'name': self['name'],
+            'secret': self['secret'],
+            'issuer': self['issuer'],
+            'type': self['type'],
+            'counter': self['counter'],
+            'url': self.url()
+        })
+
+class MongoOTP(object):
+    '''
+    MongoDB Connection objectlet that returns query results.
+    Automatically converts to a regular expression search across the fields
+    that might match search terms.
+    '''
+    def __init__(self):
+        config = Config.getConfig()
+        self.gpg = GnupgHelper(config)
+        mongo_user = config['mongo']['username']
+        mongo_pass = self.gpg.decrypt(config['mongo']['password']).strip()
+        mongo_host = config['mongo']['host']
+        mongo_opts = urlencode(config['mongo']['opts'])
+        mongo_url = f'mongodb://{mongo_user}:{mongo_pass}@{mongo_host}/?{mongo_opts}'
+        log.debug(f'Connecting to: {mongo_url}')
+        self.conn = MongoClient(mongo_url)
+        self.db = self.conn[ config['mongo']['dbname'] ]
+        # self.col = self.db[ config['mongo']['collection'] ]
+
+    def search(self, query: str) -> list:
+        '''
+        Simply search for the results from the DB. Decide what to do after that.
+        '''
+        log.info(f'Searching for {query}')
+        searchTerm = re.compile(query, re.IGNORECASE)
+        result = []
+        searchQuery = {
+          '$or': [
+            { 'name': searchTerm },
+            { 'issuer': searchTerm },
+          ]
+        }
+        for otpauth in self.db.otpauthgpg.find(searchQuery):
+            otpauth['secret'] = self.gpg.decrypt(otpauth['secret'])
+            result.append(OtpAuthCode(**otpauth))
+        return result
+
+    def add(self, otpauth: OtpAuthCode) -> None:
+        '''
+        Add a new OTP auth code to the DB.
+        '''
+        log.info(f'Adding {otpauth["name"]}')
+        otpauth['dateadded'] = datetime.datetime.now()
+        self.db.otpauthgpg.insert_one(otpauth)
+
+    def update(self, otpauth: OtpAuthCode) -> None:
+        '''
+        Update the secret to an otpauth code.
+        '''
+        log.info(f'Updating {otpauth["name"]} with new secret {otpauth["secret"]}')
+        update_result = self.db.otpauthgpg.update_one({
+            'name': otpauth['name'],
+            'issuer': otpauth['issuer']
+            }, {
+              '$set': {
+                'secret': otpauth['secret']
+              }
+        })
+        log.debug(update_result)
+        return 0
+
+    def list(self) -> None:
+        '''
+        Show available QR codes.
+        '''
+        log.info('\x01\x1b[1m\x02%30s\x01\x1b[0m\x02 | \x01\x1b[1m\x02%s\x01\x1b[0m\x02' % ('Issuer', 'Name'))
+        results = []
+        for otpauthdata in self.db.otpauthgpg.find({}):
+            otpauth = OtpAuthCode(**otpauthdata)
+            results.append({'issuer': otpauth.issuer, 'name': otpauth.name})
+        for otpauth in sorted(results, key=lambda x: x['name']):
+            log.info('%(issuer)30s | %(name)s' % otpauth)
+
+
+class GnupgHelper(object):
+    '''
+    Take the rough edges off of gnupg by giving us simple encryption and decryption methods.
+    I don't need to think about keys past this point.
+    '''
+    def __init__(self, config: Config):
+        self.signingkey = config['signingkey']
+        self.encryptkey = config['encryptkey']
+        self.gpg = gnupg.GPG(gnupghome=os.getenv('HOME', '/home/markizano') + '/.gnupg', use_agent=True)
+
+    def encrypt(self, mesg: str) -> str:
+        encrypted = self.gpg.encrypt(mesg, self.encryptkey, sign=self.signingkey)
+        return encrypted.data.decode('utf-8') if encrypted.ok else False
+
+    def decrypt(self, mesg: str) -> str:
+        decrypted = self.gpg.decrypt(mesg)
+        return decrypted.data.decode('utf-8') if decrypted.ok else False
+
+def encryptTables() -> None:
+    '''
+    Temporary function(maybe?) to read all values from otpauth mongodb collection and
+    write encrypted values to the otpauthgpg collection.
+    '''
+    mongo = MongoOTP()
+    for otpauth in mongo.db.otpauthcodes.find():
+        log.info(f'Encrypting {otpauth["name"]}')
+        otpauth['secret'] = mongo.gpg.encrypt(otpauth['secret'])
+        mongo.db.otpauthgpg.insert_one(otpauth)
+
+def pickAuth(otpauths) -> list:
+    '''
+    Make the user pick an auth code if we found more than 1.
+    Return the selection so we will always have just 1 auth code.
+    '''
+    log.info('Pick:')
+    for i, o in enumerate(otpauths):
+        log.info(f'[{i}]: {o["name"]} ({o["issuer"]})')
+    sys.stderr.write('?: ')
+    sys.stderr.flush()
+    which = input()
+    return [ otpauths.pop(int(which)) ]
+
+def askSecret() -> OtpAuthCode:
+    '''
+    Ask for the information needed to create a new secret from the user.
+    Return a data structure of the secret we need to store. Encrypt the
+    secret as soon as we get it from the user.
+    '''
+    log.info('Please tell me your secrets:')
+    speak('Please fill out the form that follows')
+    sys.stderr.write('Name: ')
+    sys.stderr.flush()
+    name = input()
+    sys.stderr.write('Secret: ')
+    sys.stderr.flush()
+    secret = GnupgHelper().encrypt( input().strip() )
+    sys.stderr.write('Issuer: ')
+    sys.stderr.flush()
+    issuer = input()
+    return OtpAuthCode(**{
+        'name': name,
+        'secret': secret,
+        'issuer': issuer,
+        'type': 'totp',
+        'counter': None
+    })
+
+def fromClipboard() -> OtpAuthCode:
+    '''
+    Read the QR code from the clipboard, parse the resulting QR code using
+    zbarimg and return the secrets data structure.
+    Perform this operation by using subprocess.communicate() pipelines
+    between `xclip` and `zbarimg` commands.
+    '''
+    log.info('Reading from clipboard')
+    speak('Reading qr code from clipboard')
+    xclip = subprocess.Popen(['xclip', '-sel', 'c', '-o', '-t', 'image/png'], stdout=subprocess.PIPE)
+    zbarimg = subprocess.Popen(['zbarimg', '--raw', '-q', '-'], stdin=xclip.stdout, stdout=subprocess.PIPE)
+    # sample output from the above operation:
+    #     otpauth://totp/MyIssuerAdmin:markizano?secret=_SuperSecret_&issuer=MyIssuerAdmin
+    zbarimg.wait()
+    xclip.wait()
+    qrdata = zbarimg.stdout.read().decode().strip()
+    log.info(f'QR Code data: {qrdata}')
+    result = parseQR(qrdata)
+    speak(f'Read QR data. Issuer found as {result["issuer"]} and name found as {result["name"]}')
+    return result
+
+def parseQR(qrdata: str) -> OtpAuthCode:
+    '''
+    Parse the QR code data into a dictionary of the secret data structure.
+    '''
+    log.info('Parsing QR code data')
+    qrdata = urlparse(qrdata)
+    params = parse_qs(qrdata.query)
+    config = Config.getConfig()
+    return OtpAuthCode(**{
+        'name': qrdata.path.split('/')[-1],
+        'secret': GnupgHelper(config).encrypt(params['secret'][0]),
+        'issuer': params['issuer'][0],
+        'type': 'totp',
+        'counter': None
+    })
+
+def usage():
+    sys.stderr.write(__doc__)
+    sys.stderr.flush()
+    return 8
+
+def main(name: str):
+    if not name or re.match('^--?h(?:elp)?$', name, re.IGNORECASE):
+        return usage()
+    if re.match('encrypt', name, re.IGNORECASE):
+        return encryptTables()
+    if re.match('^add$', name, re.IGNORECASE):
+        return MongoOTP().add(askSecret())
+    if re.match('^add-qr$', name, re.IGNORECASE):
+        return MongoOTP().add(fromClipboard())
+    if re.match('^update-qr$', name, re.IGNORECASE):
+        qrdata = fromClipboard()
+        return MongoOTP().update(qrdata)
+    if re.match('^list$', name, re.IGNORECASE):
+        return MongoOTP().list()
+    # Default action.
+    speak(f'Searching for {name}')
+    otpauths = MongoOTP().search(name)
+    if len(otpauths) > 1:
+        otpauths = pickAuth(otpauths)
+    if not len(otpauths):
+        log.error('No auths found.')
+        speak(f'No aurhs found for {name}')
+        return 1
+    otpauth = otpauths.pop()
+    oathtool = [ 'oathtool', '--totp', '-b', otpauth.secret ]
+    output = subprocess.run(oathtool, capture_output=True)
+    authcode = output.stdout.decode().strip()
+    print(authcode)
+    xclip_c = subprocess.Popen(['xclip', '-sel', 'c'], stdin=subprocess.PIPE)
+    xclip_c.communicate(input=authcode.encode())
+    xclip_p = subprocess.Popen(['xclip', '-sel', 'p'], stdin=subprocess.PIPE)
+    xclip_p.communicate(input=authcode.encode())
+    log.info(f'Copied {authcode} to clipboard as well')
+    speak(f'Your OTP code for {otpauth["name"]} has been copied to clipboard')
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1]))
+
+
