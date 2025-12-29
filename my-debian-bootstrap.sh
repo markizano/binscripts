@@ -21,13 +21,13 @@ BOOTSTRAP_TGZ=/home/media/software/linux/debootstrap-devuan-chimaera.tgz
 
 INIT_PKGS='at,bash-completion,bind9-host,build-essential,colordiff,cmake,coreutils,curl,command-not-found'
 INIT_PKGS+=',cryptsetup,file,fluxbox,ftp,git,gnupg2,gparted,ifupdown,lm-sensors,lsof,locales,lvm2,mlocate,nano,ncdu,nfs-common'
-INIT_PKGS+=',ncdu,openssh-client,openssh-server,openssl,perl,pkg-config,python3,python3-pip,python3-setuptools,rdate,rsync,screen,sudo,syslog-ng'
+INIT_PKGS+=',ncdu,openssh-client,openssh-server,openssl,perl,pkg-config,python3,python3-pip,python3-setuptools,rdate,rsync,screen,syslog-ng'
 INIT_PKGS+=',telnet,terminator,time,tree,whois,wireless-tools,iw,wipe,wget,xfsdump,xfsprogs,x11-xserver-utils'
 
 
 echo "Now initializing the system... This make take some time."
 #debootstrap --unpack-tarball $BOOTSTRAP_TGZ --arch=amd64 --include=$INIT_PKGS --exclude=rsyslog --components="$COMPONENTS" "$DISTRO" "$ROOTFS" "$MIRROR"
-debootstrap --arch=amd64 --include=$INIT_PKGS --exclude=rsyslog,libsystemd0 --components="$COMPONENTS" "$DISTRO" "$ROOTFS" "$MIRROR"
+#debootstrap --arch=amd64 --include=$INIT_PKGS --exclude=rsyslog --components="$COMPONENTS" "$DISTRO" "$ROOTFS" "$MIRROR"
 echo "Done installing base system."
 
 export HOME=/root
@@ -42,7 +42,7 @@ perl -i -pe 's/^#\s*(en_US.UTF-8.*).*/\1/' $ROOTFS/etc/locale.gen
 $chr locale-gen
 
 echo -e "Acquiring keys for apt installs..."
-APT_KEYS='DD3C368A8DE1B7A0' # Opera
+APT_KEYS='4B8EC3BAABDC4346' # Opera
 APT_KEYS+=' EB3E94ADBE1229CF' # MS VSCode
 APT_KEYS+=' 7EA0A9C3F273FCD8' # Docker
 APT_KEYS+=' D980A17457F6FB06' # Signal-Desktop
@@ -93,17 +93,14 @@ PKGS=''
 PKGS=' sshfs cryptsetup lvm2'
 
 # libmesa for compiling kawpowminer
-#PKGS+=' mesa-common-dev'
+PKGS+=' mesa-common-dev'
 
 # Shells and tools
 PKGS+=' terminator evince'
 PKGS+=' putty-tools'
 PKGS+=' android-tools-adb android-system-dev android-tools-fastboot android-tools-fsutils'
-#PKGS+=' rdesktop'
-#PKGS+=' wireshark speedtest-cli'
-
-# Xorg packages that are helpful utilities.
-PKGS+='xbacklight xclip xinput xdotool xautomation xdg-utils x11-xserver-utils'
+PKGS+=' rdesktop'
+PKGS+=' wireshark speedtest-cli'
 
 # Databases
 PKGS+=' mongodb-org-shell mongodb-org-tools'
@@ -135,7 +132,7 @@ rm -r $ROOTFS/tmp/kernel/
 echo "Done installing kernel."
 
 # Perl
-echo yes | $chr cpan CPAN Net::Graphite File::Tail
+$chr cpan CPAN Net::Graphite File::Tail
 
 $chr addgroup --system --gid=200 apps
 $chr addgroup --gid=1006 kizano
