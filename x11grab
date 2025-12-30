@@ -1,0 +1,88 @@
+#!/bin/bash
+
+# Usage:
+#
+#    AVOUTFILE=screecap.mkv x11grab
+#
+# Records the screen, the output to the speakers and whatever your default mic recording device is.
+# After starting the record, you can toggle which input is recorded with the GUI interface: `pavucontrol`
+# or direct this with $PULSE_MIC_SOURCE
+# Use `pactl list sources` to list the available sources.
+
+
+if [ -n "$DEBUG" ]; then
+  set -x
+fi
+FFMPEG=${FFMPEG:-"ffmpeg -hide_banner"}
+
+#####! BEGIN: Configuration Section !#####
+
+# 0-index of which screen to capture on the $DISPLAY
+SCREEN=${1:-0}
+
+# The "$W,$H" factor for the offset. What's the offset of the X,Y anchor for the top-left to start recording?
+OFFSET=${OFFSET:-${2:-0,0}}
+
+# This was more relevant on a computer with 2 monitors. If you have >1 display, you can include them in this list.
+SCREENS=(
+'0,0'
+)
+
+# If the sizes of the displays are different, you can indicate them here.
+SIZES=(
+1920x1080
+1920x1080
+)
+
+# Monitor the output sent to the speakers by using Pulse audio monitor.
+PULSE_AUDIO_SOURCE=${PULSE_AUDIO_SOURCE:-alsa_output.pci-0000_00_1f.3.analog-stereo.monitor}
+PULSE_MIC_SOURCE=${PULSE_MIC_SOURCE:-alsa_input.usb-Focusrite_Scarlett_2i2_USB_Y8AN6AE31F77B4-00.analog-stereo}
+
+# Set the video and audio codecs to be used in the output.
+ACODEC=${ACODEC:-aac}
+VCODEC=${VCODEC:-h264}
+
+# Output file.
+AVOUTFILE=${AVOUTFILE:-/tmp/`date %+F`_x11grab.mkv}
+
+# Size of the screen.
+SIZE=${SIZE:-${SIZES[$SCREEN]:-$3}}
+# Offset is how many pixels from the top-left corner of the screen to offset before capturing the screen.
+# NOTE: ffmpeg will complain if you indicate a size that is larger than the screen size.
+OFFSET=${OFFSET:-$SIZES[0]}
+
+# This loop allows for basic processing of some command line options in case you don't know the env var names. (read:accessibility)
+while getopts 'osavf' opt; do
+  case "$opt" in
+    o) OFFSET=$OPTARG ;;
+    s) SIZE=$OPTARG ;;
+    a) ACODEC=$OPTARG ;;
+    v) VCODEC=$OPTARG ;;
+    f) AVOUTFILE=$OPTARG ;;
+  esac
+done
+
+#####! END: Configuration Section !#####
+
+# FILTER_COMPLEX="[0:a]asetpts=PTS-STARTPTS[first];"
+# FILTER_COMPLEX+="[1:a]asetpts=PTS-STARTPTS[second];"
+# FILTER_COMPLEX+="[first][second]amix=inputs=2:normalize=0,aresample=async=1:min_hard_comp=0.100:first_pts=0[audio]"
+
+# Video Input options.
+VIOPTS=${VIOPTS:-"-thread_queue_size 1024 -analyzeduration 100M -probesize 100M -framerate ${FRAME_RATE:-30} -f x11grab -s ${SIZE} -i $DISPLAY+${OFFSET}"}
+# Audio Input options.
+AIOPTS=${AIOPTS:-"-thread_queue_size 1024 -ac 2 -channel_layout stereo -f pulse -i $PULSE_AUDIO_SOURCE -thread_queue_size 1024 -ac 2 -channel_layout stereo -f pulse -i $PULSE_MIC_SOURCE"}
+
+# Video Output options.
+VOOPTS=${VOOPTS:-"-c:v ${VCODEC} -preset ultrafast -crf ${CRF:-28} -pix_fmt yuv420p -movflags +faststart -fflags +genpts -rtbufsize 256M -map 0:v -metadata:s:v:0 source=screencap"}
+# Audio Output options.
+AOOPTS=${AOOPTS:-"-c:a ${ACODEC} -map 1:a -metadata:s:a:0 source=audio -map 2:a -metadata:s:a:0 source=mic -b:a 192k"}
+
+AVOPTS="$VIOPTS $AIOPTS $VOOPTS $AOOPTS -y $AVOUTFILE"
+
+#pkill compton
+pkill picom
+#trap "$HOME/bin/compton.sh" EXIT
+
+echo "Execute: $FFMPEG $AVOPTS"
+eval "$FFMPEG $AVOPTS"
