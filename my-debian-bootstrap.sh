@@ -5,47 +5,6 @@
 . /usr/local/bin/common.sh
 
 [ "$UID" -eq 0 ] || { log_error_msg "Need to be invited to the party, dood..." >&2 && exit 1; }
-# Reset home directory because I often don't reset the sudo env in my personal setups.
-export HOME=/root
-
-#@TODO: I want to get around this by checking mount paths and attempting to mount if necessary.
-log_warn_msg "I assume you have already partitioned your drives and mounted the root and boot filesystems."
-
-test -z "$ROOTFS" && read -p 'What is the root of the filesystem I would be acting against? ' ROOTFS
-test -d "$ROOTFS" || {
-  #@TODO: Like above: Attempt to create the workspace and mount it.
-  log_fail_msg "$ROOTFS does not appear to be a directory." >&2
-  exit 1
-}
-
-set -e
-
-MIRROR=${MIRROR:-http://deb.devuan.org/merged/}
-DISTRO=${DISTRO:-excalibur}
-BOOTSTRAP_TGZ=${BOOTSTRAP_TGZ:-"/media/tank/software/linux/debootstrap-devuan-$DISTRO.tgz"}
-
-# Pipeline to replace this text if it gets out of order or too long of a line:
-# echo $(echo ${INIT_PKGS} | perl -pe 's/,/\n/g' | sort | grep -vP $whitespace) | fold -w90 -s | while read line; do test -z "$first" && { eq='='; first=1; } || { eq='+='; }; echo "INIT_PKGS${eq}',${line}'"; done | perl -pe 's/ /,/g' | clip
-INIT_PKGS='bash-completion,ca-certificates,command-not-found,coreutils,cryptsetup,curl,dirmngr'
-INIT_PKGS+=',file,gpg,gpg-agent,ifupdown,locales,lsof,lvm2,pinentry-curses,plocate,nano,ncdu,openssl'
-INIT_PKGS+=',python3,syslog-ng,tar,tree,wget'
-
-# If we are just generating the tarball, exit early to avoid trying to install the rest of the system since
-# debootstrap will wipe the directory clean afterwards.
-function onlyMakeTarball() {
-  bootstrap_dir="`dirname $BOOTSTRAP_TGZ`"
-  test -d "$bootstrap_dir" || mkdir -p "$bootstrap_dir"
-  debootstrap --make-tarball $BOOTSTRAP_TGZ --arch=amd64 --include=$INIT_PKGS --exclude=rsyslog --components="main" "$DISTRO" "$ROOTFS" "$MIRROR"
-}
-test -z "$ONLY_MAKE_TARBALL" || {
-  onlyMakeTarball
-  exit $?
-}
-
-log_info_msg "Now initializing the system... This make take some time."
-test -r "$BOOTSTRAP_TGZ" && bstrap="--unpack-tarball $BOOTSTRAP_TGZ"
-debootstrap $bstrap --arch=amd64 --include=$INIT_PKGS --exclude=rsyslog --components="main" "$DISTRO" "$ROOTFS" "$MIRROR"
-log_ok_msg "Done installing base system."
 
 # Override some environment variables that are unfortunately copied into the environment.
 export HOME=/root
@@ -56,68 +15,21 @@ export XAUTHORITY=/root/.Xauthority
 chr="chroot $ROOTFS"
 aptget='apt-get -oDPkg::Options::=--force-confold -oDPkg::Options::=--force-confdef'
 
-log_info_msg "Let me fix locales right quick..."
-perl -i -pe 's/^#\s*(en_US.UTF-8.*).*/\1/' $ROOTFS/etc/locale.gen
-$chr locale-gen
-log_ok_msg "Locales fixed!"
+MIRROR=${MIRROR:-http://deb.devuan.org/merged/}
+DISTRO=${DISTRO:-excalibur}
+BOOTSTRAP_TGZ=${BOOTSTRAP_TGZ:-"/media/tank/software/linux/debootstrap-devuan-$DISTRO.tgz"}
 
-
-log_info_msg "Acquiring keys for apt installs..."
-APT_KEYS='11EE8C00B693A745' # Opera
-APT_KEYS+=' EB3E94ADBE1229CF' # MS VSCode
-APT_KEYS+=' 7EA0A9C3F273FCD8' # Docker
-APT_KEYS+=' D980A17457F6FB06' # Signal-Desktop
-APT_KEYS+=' 7373B12CE03BEB4B' # Runescape
-APT_KEYS+=' C6ABDCF64DB9A0B2' # Slack
-APT_KEYS+=' 41DE058A4E7DCA05' # MongoDB
-APT_KEYS+=' 32EE5355A6BC6E42' # Google-Chrome
-$chr gpg --keyserver keyserver.ubuntu.com --recv-keys $APT_KEYS
-for key in $APT_KEYS; do
-  $chr gpg -a --export $key > $ROOTFS/etc/apt/trusted.gpg.d/$key.asc
-done
-rm -r $ROOTFS/root/.gnupg
-$chr curl -vso /etc/apt/trusted.gpg.d/markizano.net.asc https://apt.markizano.net/key.asc
-$chr apt update
-
-log_info_msg "Ok! Let's see about those pretext packages."
-
-$chr dpkg --print-foreign-architectures | grep -q i386 || $chr dpkg --add-architecture i386
-
-log_info_msg "Good. Now let's get those repositories up to date."
-
-echo "deb [arch=amd64] https://download.docker.com/linux/debian trixie stable"              > $ROOTFS/etc/apt/sources.list.d/docker.list
-echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main"                  > $ROOTFS/etc/apt/sources.list.d/google-chrome.list
-echo "deb [arch=amd64] http://repo.mongodb.org/apt/debian bookworm/mongodb-org/8.0 main"    > $ROOTFS/etc/apt/sources.list.d/mongodb.list
-echo "deb [arch=amd64] https://deb.opera.com/opera-stable/ stable non-free"                 > $ROOTFS/etc/apt/sources.list.d/opera-stable.list
-echo "deb [arch=amd64] https://apt.markizano.net kernel main"                               > $ROOTFS/etc/apt/sources.list.d/kernel.list
-
-echo "deb [arch=amd64,i386] $MIRROR $DISTRO main contrib non-free non-free-firmware" > $ROOTFS/etc/apt/sources.list
-echo "deb [arch=amd64,i386] $MIRROR $DISTRO-security main contrib non-free" >> $ROOTFS/etc/apt/sources.list
-echo "deb [arch=amd64,i386] $MIRROR $DISTRO-updates main contrib non-free" >> $ROOTFS/etc/apt/sources.list
-
-
-log_info_msg "Excellent. Time for one more update."
-$chr apt -q update
-
-log_info_msg "Mounting filesystems..."
-(
-  cd $ROOTFS
-  mount -t proc proc proc
-  mount -t sysfs sysfs sys
-  mount -t devtmpfs -orw,nosuid,relatime,size=8142492k,nr_inodes=2035623,mode=755 udev dev
-  mount --rbind /dev/pts dev/pts
-)
-
-# System commands
-$chr apt install -qy apt-transport-https
-
-log_info_msg -n "Now listing packages.... "
+# Pipeline to replace this text if it gets out of order or too long of a line:
+# echo $(echo ${INIT_PKGS} | perl -pe 's/,/\n/g' | sort | grep -vP $whitespace) | fold -w90 -s | while read line; do test -z "$first" && { eq='='; first=1; } || { eq='+='; }; echo "INIT_PKGS${eq}',${line}'"; done | perl -pe 's/ /,/g' | clip
+INIT_PKGS='apt-transport-https,bash-completion,ca-certificates,command-not-found,coreutils,cryptsetup'
+INIT_PKGS+=',curl,dirmngr,file,gpg,gpg-agent,ifupdown,locales,lsof,lvm2,pinentry-curses,plocate,nano'
+INIT_PKGS+=',ncdu,openssl,python3,sudo,syslog-ng,tar,tree,wget'
 
 PKGS=''
 
-# Post-Install base packages.
+# Post-Install desired packages.
 PKGS+='compton debootstrap fluxbox ftp git gnupg2 gparted ipcalc iw lm-sensors'
-PKGS+=' nfs-common openssh-client openssh-server pciutils perl pkg-config pluma'
+PKGS+=' nfs-common openssh-client openssh-server pciutils perl pkg-config pluma mousepad'
 PKGS+=' python3-pip python3-setuptools rdate rsync screen sudo telnet terminator time'
 PKGS+=' unzip whois wipe wireless-tools x11-xserver-utils xfsdump xfsprogs zip'
 
@@ -135,7 +47,7 @@ PKGS+=' adb'
 PKGS+=' rar unrar'
 
 # Databases
-PKGS+=' mongodb-mongosh docker'
+PKGS+=' mongodb-mongosh docker-ce'
 
 # Chat and Mail
 PKGS+=' hexchat transmission-cli transmission-gtk'
@@ -147,35 +59,147 @@ PKGS+=' mpv vlc slim console-setup'
 PKGS+=' google-chrome-stable'
 
 PKGS+=' linux-image-6.6.58 linux-headers-6.6.58 linux-libc-dev=6.6.58-3'
-log_ok_msg "Done!"
 
-log_info_msg "Now installing. This may take a while, depending on your network connection, core count, and IOPS available to disk..."
-# prevent wireshark from asking about non-root users being able to pkt-capture.
-#echo "wireshark-common wireshark-common/group-is-user-group error" | $chr debconf-set-selections
-echo "keyboard-configuration keyboard-configuration/layoutcode string us" | $chr debconf-set-selections
-$chr env DEBIANFRONTEND=noninteractive $aptget install -y $PKGS
+#@TODO: I want to get around this by checking mount paths and attempting to mount if necessary.
+log_warn_msg "I assume you have already partitioned your drives and mounted the root and boot filesystems."
 
-#read -p 'Grub or rEFInd? [grub/refind] ' grubRefind
-#echo "$grubRefind" | grep -iP '^g(?:rub)?$' && {
-#  $chr $aptget install -y grub2 || true
-#}
-#echo "$grubRefind" | grep -iP '^r(?:efind)?$' && {
-#  # Need to install rEFInd separate since it may fail.
-#  $chr $aptget install -y refind || true
-#}
+test -z "$ROOTFS" && read -p 'What is the root of the filesystem I would be acting against? ' ROOTFS
+test -d "$ROOTFS" || {
+  #@TODO: Like above: Attempt to create the workspace and mount it.
+  log_fail_msg "$ROOTFS does not appear to be a directory." >&2
+  exit 1
+}
 
-$chr $aptget install -y refind
+# If we are just generating the tarball, exit early to avoid trying to install the rest of the system since
+# debootstrap will wipe the directory clean afterwards.
+function onlyMakeTarball () {
+  bootstrap_dir="`dirname $BOOTSTRAP_TGZ`"
+  test -d "$bootstrap_dir" || mkdir -p "$bootstrap_dir"
+  debootstrap --make-tarball $BOOTSTRAP_TGZ --arch=amd64 --include=$INIT_PKGS --exclude=rsyslog --components="main" "$DISTRO" "$ROOTFS" "$MIRROR"
+}
+test -z "$ONLY_MAKE_TARBALL" || {
+  onlyMakeTarball
+  exit $?
+}
 
-# Perl
-yes | $chr cpan CPAN Net::Graphite File::Tail
+function set_the_foundation () {
+  log_info_msg "Now initializing the system... This make take some time."
+  test -r "$BOOTSTRAP_TGZ" && bstrap="--unpack-tarball $BOOTSTRAP_TGZ"
+  debootstrap $bstrap --arch=amd64 --include=$INIT_PKGS --exclude=rsyslog --components="main" "$DISTRO" "$ROOTFS" "$MIRROR"
+  log_ok_msg "Done installing base system."
+}
 
-$chr addgroup --system --gid=200 apps
-$chr addgroup --gid=1006 kizano
-$chr adduser --gid=1006 --uid=1000 --home=/home/markizano --shell=/bin/bash markizano
-for group in apps docker staff wheel disk sudo floppy cdrom audio video plugdev netdev; do
-  $chr adduser markizano $group || true;
-done
-mkdir -m0700 $ROOTFS/root/.ssh
+function set_locales () {
+  log_info_msg "Let me fix locales right quick..."
+  perl -i -pe 's/^#\s*(en_US.UTF-8.*).*/\1/' $ROOTFS/etc/locale.gen
+  $chr locale-gen
+  log_ok_msg "Locales fixed!"
+}
+
+function setup_gpg_keys () {
+  log_info_msg "Acquiring keys for apt installs..."
+  APT_KEYS='11EE8C00B693A745' # Opera
+  APT_KEYS+=' EB3E94ADBE1229CF' # MS VSCode
+  APT_KEYS+=' 7EA0A9C3F273FCD8' # Docker
+  APT_KEYS+=' D980A17457F6FB06' # Signal-Desktop
+  APT_KEYS+=' 7373B12CE03BEB4B' # Runescape
+  APT_KEYS+=' C6ABDCF64DB9A0B2' # Slack
+  APT_KEYS+=' 41DE058A4E7DCA05' # MongoDB
+  APT_KEYS+=' 7721F63BD38B4796' # Google-Chrome
+  $chr gpg --keyserver keyserver.ubuntu.com --recv-keys $APT_KEYS
+  for key in $APT_KEYS; do
+    $chr gpg -a --export $key > $ROOTFS/etc/apt/trusted.gpg.d/$key.asc
+  done
+  rm -r $ROOTFS/root/.gnupg
+  $chr curl -vso /etc/apt/trusted.gpg.d/markizano.net.asc https://apt.markizano.net/key.asc
+  $chr apt update
+}
+
+function add_i386_architecture () {
+  $chr dpkg --print-foreign-architectures | grep -q i386 || $chr dpkg --add-architecture i386
+  log_info_msg "Good. Now let's get those repositories up to date."
+}
+
+function add_foreign_packages () {
+  log_info_msg "Setting up foreign package sites..."
+  echo "deb [arch=amd64] https://download.docker.com/linux/debian trixie stable"              > $ROOTFS/etc/apt/sources.list.d/docker.list
+  echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main"                  > $ROOTFS/etc/apt/sources.list.d/google-chrome.list
+  echo "deb [arch=amd64] http://repo.mongodb.org/apt/debian bookworm/mongodb-org/8.0 main"    > $ROOTFS/etc/apt/sources.list.d/mongodb.list
+  echo "deb [arch=amd64] https://deb.opera.com/opera-stable/ stable non-free"                 > $ROOTFS/etc/apt/sources.list.d/opera-stable.list
+  echo "deb [arch=amd64] https://apt.markizano.net kernel main"                               > $ROOTFS/etc/apt/sources.list.d/kernel.list
+
+  echo "deb [arch=amd64,i386] $MIRROR $DISTRO main contrib non-free non-free-firmware" > $ROOTFS/etc/apt/sources.list
+  echo "deb [arch=amd64,i386] $MIRROR $DISTRO-security main contrib non-free" >> $ROOTFS/etc/apt/sources.list
+  echo "deb [arch=amd64,i386] $MIRROR $DISTRO-updates main contrib non-free" >> $ROOTFS/etc/apt/sources.list
+  log_info_msg 'Foreign packages set!'
+}
+
+function mount_filesystems () {
+  log_info_msg "Mounting filesystems..."
+  (
+    cd $ROOTFS
+    mount -t proc proc proc
+    mount -t sysfs sysfs sys
+    mount -t devtmpfs -orw,nosuid,relatime,size=8142492k,nr_inodes=2035623,mode=755 udev dev
+    mount --rbind /dev/pts dev/pts
+  )
+}
+
+function install_pkgs () {
+  log_info_msg "Now installing. This may take a while, depending on your network connection, core count, and IOPS available to disk..."
+  # prevent wireshark from asking about non-root users being able to pkt-capture.
+  #echo "wireshark-common wireshark-common/group-is-user-group error" | $chr debconf-set-selections
+  echo "keyboard-configuration keyboard-configuration/layoutcode string us" | $chr debconf-set-selections
+  $chr env DEBIANFRONTEND=noninteractive $aptget install -y $PKGS
+  mkdir -m0700 $ROOTFS/root/.ssh
+}
+
+function install_bootloader () {
+  test -n "$bootloader" || read -p 'Grub or rEFInd? [grub/refind] ' bootloader
+  echo "$bootloader" | grep -iP '^g(?:rub)?$' && {
+    $chr $aptget install -y grub2 || true
+  }
+  echo "$bootloader" | grep -iP '^r(?:efind)?$' && {
+    # Need to install rEFInd separate since it may fail.
+    $chr $aptget install -y refind || true
+  }
+}
+
+function setup_perl () {
+  # Perl
+  yes | $chr cpan CPAN Net::Graphite File::Tail
+
+}
+
+function install_markizano () {
+  $chr addgroup --system --gid=200 apps
+  $chr addgroup --gid=1006 kizano
+  $chr adduser --gid=1006 --uid=1000 --home=/home/markizano --shell=/bin/bash markizano
+  for group in apps docker staff wheel disk sudo floppy cdrom audio video plugdev netdev; do
+    $chr adduser markizano $group || true;
+  done
+
+}
+
+set -e
+
+#set_the_foundation
+#set_locales
+#setup_gpg_keys
+
+log_info_msg "Ok! Let's see about those pretext packages."
+
+#add_i386_architecture
+#add_foreign_packages
+
+log_info_msg "Excellent. Time for one more update."
+$chr apt -q update
+
+#mount_filesystems
+#install_pkgs
+#install_bootloader
+#setup_perl
+#install_markizano
 
 rcscripts=$'/Td6WFoAAATm1rRGAgAhARYAAAB0L+Wj4J//IiZdABcLvBx9AZXAHUpGnBzE/yBwaxn9OfoRDvil59FSC60WQRQCs8vu+RW7rQU1
 xMH9bAMNwaZoQQK9J+E3ND/3o0OvWlqFHO1oYj/EG6BysAEbCXVJ/qCjKtQyWZyDmJFk/O3DgNyFO1sAz2i76qPRbAm56s1exLD3
@@ -296,7 +320,7 @@ pSuESWy54ymI5HmIhwSnp6DaVRKb5nF3moiXmfMh89MIvPQGQWYbxOOLL0D+RvSXoSQbc+ElTmCK/58c
 3f68WjuJu8UBPdMtksDoxjyHa8P+VQPvtVPZqMYMTo4HT2L828VuMYfe9PS9x45aUs38bkukiONkrMmdVPTAMB9XqULPsK2QjgAA
 APyWQk21w4ViAAHCRIDAAgAS18Z8scRn+wIAAAAABFla'
 
-echo "$rcscripts" | base64 -d | $chr sudo -H -umarkizano -gkizano tar -C /home/markizano -zxvf-
+echo "$rcscripts" | base64 -d | $chr sudo -H -umarkizano -gkizano tar -C /home/markizano -Jxvf-
 
 log_ok_msg Complete.
 
