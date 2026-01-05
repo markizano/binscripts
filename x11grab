@@ -40,10 +40,11 @@ PULSE_MIC_SOURCE=${PULSE_MIC_SOURCE:-alsa_input.usb-Focusrite_Scarlett_2i2_USB_Y
 
 # Set the video and audio codecs to be used in the output.
 ACODEC=${ACODEC:-aac}
-VCODEC=${VCODEC:-h264}
+# h264 is normal CPU; h264_nvenc is NVIDIA GPU-based encoder.
+VCODEC=${VCODEC:-h264_nvenc}
 
 # Output file.
-AVOUTFILE=${AVOUTFILE:-/tmp/`date %+F`_x11grab.mkv}
+AVOUTFILE=${AVOUTFILE:-/tmp/`date +%F`_x11grab.mkv}
 
 # Size of the screen.
 SIZE=${SIZE:-${SIZES[$SCREEN]:-$3}}
@@ -64,19 +65,23 @@ done
 
 #####! END: Configuration Section !#####
 
+QUEUE_SIZE=4096
+
+## Using amix on 2 audio streams can cause CPU delay. Save to separate streams so they don't cause
+## in-record stress and combine them in a 2nd-pass over the result.
 # FILTER_COMPLEX="[0:a]asetpts=PTS-STARTPTS[first];"
 # FILTER_COMPLEX+="[1:a]asetpts=PTS-STARTPTS[second];"
 # FILTER_COMPLEX+="[first][second]amix=inputs=2:normalize=0,aresample=async=1:min_hard_comp=0.100:first_pts=0[audio]"
 
 # Video Input options.
-VIOPTS=${VIOPTS:-"-thread_queue_size 1024 -analyzeduration 100M -probesize 100M -framerate ${FRAME_RATE:-30} -f x11grab -s ${SIZE} -i $DISPLAY+${OFFSET}"}
+VIOPTS=${VIOPTS:-"-thread_queue_size $QUEUE_SIZE -analyzeduration 100M -probesize 100M -framerate ${FRAME_RATE:-30} -draw_mouse 1 -f x11grab -s ${SIZE} -i $DISPLAY+${OFFSET}"}
 # Audio Input options.
-AIOPTS=${AIOPTS:-"-thread_queue_size 1024 -ac 2 -channel_layout stereo -f pulse -i $PULSE_AUDIO_SOURCE -thread_queue_size 1024 -ac 2 -channel_layout stereo -f pulse -i $PULSE_MIC_SOURCE"}
+AIOPTS=${AIOPTS:-"-thread_queue_size $QUEUE_SIZE -ac 2 -channel_layout stereo -f pulse -i $PULSE_AUDIO_SOURCE -thread_queue_size $QUEUE_SIZE -ac 2 -channel_layout stereo -f pulse -i $PULSE_MIC_SOURCE"}
 
 # Video Output options.
-VOOPTS=${VOOPTS:-"-c:v ${VCODEC} -preset ultrafast -crf ${CRF:-28} -pix_fmt yuv420p -movflags +faststart -fflags +genpts -rtbufsize 256M -map 0:v -metadata:s:v:0 source=screencap"}
+VOOPTS=${VOOPTS:-"-c:v ${VCODEC} -rc:v cbr -tune hq -preset p3 -cq:v 19 -b:v 0 -pix_fmt yuv420p -movflags +faststart -fflags +genpts -fps_mode vfr -rtbufsize 256M -map 0:v -metadata:s:v:0 source=screencap"}
 # Audio Output options.
-AOOPTS=${AOOPTS:-"-c:a ${ACODEC} -map 1:a -metadata:s:a:0 source=audio -map 2:a -metadata:s:a:0 source=mic -b:a 192k"}
+AOOPTS=${AOOPTS:-"-c:a ${ACODEC} -af aresample=async=1 -map 1:a -metadata:s:a:0 source=audio -map 2:a -metadata:s:a:0 source=mic -b:a 192k"}
 
 AVOPTS="$VIOPTS $AIOPTS $VOOPTS $AOOPTS -y $AVOUTFILE"
 
